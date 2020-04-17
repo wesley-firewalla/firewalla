@@ -191,8 +191,12 @@ class PolicyManager2 {
             } else {
               log.info("START REENFORCING POLICY", policy.pid, action);
 
-              await this.unenforce(oldPolicy)
-              await this.enforce(policy)
+              await this.unenforce(oldPolicy).catch((err) => {
+                log.error("Failed to unenforce policy before reenforce", err.message, policy);
+              });
+              await this.enforce(policy).catch((err) => {
+                log.error("Failed to reenforce policy", err.message, policy);
+              })
             }
           } catch (err) {
             log.error("reenforce policy failed:" + err, policy)
@@ -986,7 +990,7 @@ class PolicyManager2 {
   }
 
   generateTaget(policy) {
-    const { type, target, protocol, ip, net, port } = policy
+    let { type, target, protocol, ip, net, port } = policy
     if (!_.isEmpty(target)) return target
 
     if (!_.isEmpty(ip) && !_.isArray(ip)) ip = [ip]
@@ -1024,7 +1028,7 @@ class PolicyManager2 {
   }
 
   async _enforce(policy) {
-    log.info(`Enforce policy pid:${policy.pid}, type:${policy.type}, target:${policy.target}, scope:${policy.scope}, tag:${policy.tag}, whitelist:${policy.whitelist}`);
+    log.info(`Enforce policy pid:${policy.pid}, type:${policy.type}, target:${policy.target}, scope:${policy.scope}, tag:${policy.tag}, action:${policy.action || "block"}`);
 
     const type = policy["i.type"] || policy["type"]; //backward compatibility
 
@@ -1034,7 +1038,12 @@ class PolicyManager2 {
       throw new Error("Firewalla and it's cloud service can't be blocked.")
     }
 
-    let { pid, scope, target, whitelist, tag, remotePort, localPort, protocol, direction} = policy;
+    let { pid, scope, target, action = "block", tag, remotePort, localPort, protocol, direction, upnp} = policy;
+
+    if (action !== "block" && action !== "allow") {
+      log.error(`Unsupported action ${action} for policy ${pid}`);
+      return;
+    }
 
     // tag = []
     // scope !== []
@@ -1067,6 +1076,7 @@ class PolicyManager2 {
     let remotePortSet = null;
     let remotePositive = true;
     let remoteTupleCount = 1;
+    let ctstate = null;
     if (localPort) {
       localPortSet = `c_${pid}_local_port`;
       await ipset.create(localPortSet, "bitmap:port");
@@ -1076,6 +1086,11 @@ class PolicyManager2 {
       remotePortSet = `c_${pid}_remote_port`;
       await ipset.create(remotePortSet, "bitmap:port");
       await Block.block(remotePort, remotePortSet);
+    }
+
+    if (upnp) {
+      direction = "inbound";
+      ctstate = "DNAT";
     }
     
     switch (type) {
@@ -1089,7 +1104,7 @@ class PolicyManager2 {
           await Block.block(target, Block.getDstSet(pid));
         } else {
           // apply to global without specified src/dst port, directly add to global ip or net allow/block set
-          const set = (whitelist ? 'allow_' : 'block_') + simpleRuleSetMap[type];
+          const set = (action === "allow" ? 'allow_' : 'block_') + simpleRuleSetMap[type];
           await Block.block(target, set);
           return;
         }
@@ -1134,7 +1149,7 @@ class PolicyManager2 {
         break;
       case "domain":
       case "dns":
-        await dnsmasq.addPolicyFilterEntry([target], { pid, scope, intfs, tags }).catch(() => { });
+        await dnsmasq.addPolicyFilterEntry([target], { pid, scope, intfs, tags, action }).catch(() => { });
         dnsmasq.scheduleRestartDNSService();
         if (policy.dnsmasq_only)
           return;
@@ -1142,13 +1157,13 @@ class PolicyManager2 {
         remoteSet6 = Block.getDstSet6(pid);
         if (!_.isEmpty(tags) || !_.isEmpty(intfs) || !_.isEmpty(scope) || localPortSet || remotePortSet) {
           await ipset.create(remoteSet4, "hash:ip", true);
-          await ipset.create(remoteset6, "hash:ip", false);
+          await ipset.create(remoteSet6, "hash:ip", false);
           await domainBlock.blockDomain(target, {
             exactMatch: policy.domainExactMatch,
             blockSet: Block.getDstSet(pid)
           });
         } else {
-          const set = (whitelist ? 'allow_' : 'block_') + simpleRuleSetMap[type];
+          const set = (action === "allow" ? 'allow_' : 'block_') + simpleRuleSetMap[type];
           await domainBlock.blockDomain(target, {
             exactMatch: policy.domainExactMatch,
             blockSet: set
@@ -1234,14 +1249,14 @@ class PolicyManager2 {
 
     if (!_.isEmpty(tags) || !_.isEmpty(intfs) || !_.isEmpty(scope)) {
       if (!_.isEmpty(tags))
-        await Block.setupTagsRules(pid, tags, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, whitelist ? "allow" : "block", direction, "create");
+        await Block.setupTagsRules(pid, tags, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, action, direction, "create", ctstate);
       if (!_.isEmpty(intfs))
-        await Block.setupIntfsRules(pid, intfs, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, whitelist ? "allow" : "block", direction, "create");
+        await Block.setupIntfsRules(pid, intfs, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, action, direction, "create", ctstate);
       if (!_.isEmpty(scope))
-        await Block.setupDevicesRules(pid, scope, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, whitelist ? "allow" : "block", direction, "create");
+        await Block.setupDevicesRules(pid, scope, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, action, direction, "create", ctstate);
     } else {
       // apply to global
-      await Block.setupGlobalRules(pid, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, whitelist ? "allow" : "block", direction, "create");
+      await Block.setupGlobalRules(pid, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, action, direction, "create", ctstate);
     }
   }
 
@@ -1265,13 +1280,18 @@ class PolicyManager2 {
   }
 
   async _unenforce(policy) {
-    log.info(`Unenforce policy pid:${policy.pid}, type:${policy.type}, target:${policy.target}, scope:${policy.scope}, tag:${policy.tag}, whitelist:${policy.whitelist}`);
+    log.info(`Unenforce policy pid:${policy.pid}, type:${policy.type}, target:${policy.target}, scope:${policy.scope}, tag:${policy.tag}, action:${policy.action || "block"}`);
 
     await this._removeActivatedTime(policy)
 
     const type = policy["i.type"] || policy["type"]; //backward compatibility
 
-    let { pid, scope, target, whitelist, tag, remotePort, localPort, protocol, direction} = policy;
+    let { pid, scope, target, action = "block", tag, remotePort, localPort, protocol, direction, upnp} = policy;
+
+    if (action !== "block" && action !== "allow") {
+      log.error(`Unsupported action ${action} for policy ${pid}`);
+      return;
+    }
 
     let intfs = [];
     let tags = [];
@@ -1302,6 +1322,7 @@ class PolicyManager2 {
     let remotePortSet = null;
     let remotePositive = true;
     let remoteTupleCount = 1;
+    let ctstate = null;
     if (localPort) {
       localPortSet = `c_${pid}_local_port`;
       await Block.unblock(localPort, localPortSet);
@@ -1309,6 +1330,11 @@ class PolicyManager2 {
     if (remotePort) {
       remotePortSet = `c_${pid}_remote_port`;
       await Block.unblock(remotePort, remotePortSet);
+    }
+
+    if (upnp) {
+      direction = "inbound";
+      ctstate = "DNAT";
     }
 
     switch (type) {
@@ -1319,7 +1345,7 @@ class PolicyManager2 {
         if (!_.isEmpty(tags) || !_.isEmpty(intfs) || !_.isEmpty(scope) || localPortSet || remotePortSet) {
           await Block.unblock(target, Block.getDstSet(pid));
         } else {
-          const set = (whitelist ? 'allow_' : 'block_') + simpleRuleSetMap[type];
+          const set = (action === "allow" ? 'allow_' : 'block_') + simpleRuleSetMap[type];
           await Block.unblock(target, set);
           return;
         }
@@ -1363,7 +1389,7 @@ class PolicyManager2 {
         break;
       case "domain":
       case "dns":
-        await dnsmasq.removePolicyFilterEntry([target], { pid, scope, intfs, tags }).catch(() => { });
+        await dnsmasq.removePolicyFilterEntry([target], { pid, scope, intfs, tags, action }).catch(() => { });
         dnsmasq.scheduleRestartDNSService();
         if (policy.dnsmasq_only)
           return;
@@ -1375,8 +1401,8 @@ class PolicyManager2 {
             blockSet: Block.getDstSet(pid)
           });
         } else {
-          const set = (whitelist ? 'allow_' : 'block_') + simpleRuleSetMap[type];
-          await domainBlock.unblockDomain(targeet, {
+          const set = (action === "allow" ? 'allow_' : 'block_') + simpleRuleSetMap[type];
+          await domainBlock.unblockDomain(target, {
             exactMatch: policy.domainExactMatch,
             blockSet: set
           });
@@ -1457,14 +1483,14 @@ class PolicyManager2 {
 
     if (!_.isEmpty(tags) || !_.isEmpty(intfs) || !_.isEmpty(scope)) {
       if (!_.isEmpty(tags))
-        await Block.setupTagsRules(pid, tags, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, whitelist ? "allow" : "block", direction, "destroy");
+        await Block.setupTagsRules(pid, tags, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, action, direction, "destroy", ctstate);
       if (!_.isEmpty(intfs))
-        await Block.setupIntfsRules(pid, intfs, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, whitelist ? "allow" : "block", direction, "destroy");
+        await Block.setupIntfsRules(pid, intfs, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, action, direction, "destroy", ctstate);
       if (!_.isEmpty(scope))
-        await Block.setupDevicesRules(pid, scope, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, whitelist ? "allow" : "block", direction, "destroy");
+        await Block.setupDevicesRules(pid, scope, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, action, direction, "destroy", ctstate);
     } else {
       // apply to global
-      await Block.setupGlobalRules(pid, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, whitelist ? "allow" : "block", direction, "destroy");
+      await Block.setupGlobalRules(pid, localPortSet, remoteSet4, remoteSet6, remoteTupleCount, remotePositive, remotePortSet, protocol, action, direction, "destroy", ctstate);
     }
 
     if (localPortSet) {
@@ -1570,8 +1596,9 @@ class PolicyManager2 {
     return result;
   }
 
-  async searchPolicy(waitSearch, isDomain) {
-    let result = [];
+  async searchPolicy(waitSearch, isDomain, target) {
+    const addrPort = target.split(":");
+    const targetDomain = addrPort[0];
     let ipsets = [];
     let ipsetContent = ""; // for string matching
     try {
@@ -1598,6 +1625,8 @@ class PolicyManager2 {
       log.error(err);
     }
 
+    let polices = [];
+    let crossIps = [];
     const rules = await this.loadActivePoliciesAsync();
     for (const currentTxt of waitSearch) {
       if (!currentTxt || currentTxt.trim().length == 0) continue;
@@ -1707,17 +1736,32 @@ class PolicyManager2 {
           }
         } else if (ipsetName.search(/c_bd_([a-zA-Z_]+)_set/) > -1 && iptool.isV4Format(currentTxt)) {
           matchedRules = rules.filter(rule => rule.type == "category" && ipsetName === Block.getDstSet(rule.target));
+          if (isDomain) {
+            for (const matchedRule of matchedRules) {
+              let domains = await domainBlock.getCategoryDomains(matchedRule.target);
+              domains = domains.filter(domain => !(domain == targetDomain || domain.indexOf(targetDomain) > -1));
+              for (const domain of domains) {
+                const dnsAddresses = await dnsTool.getIPsByDomain(domain);
+                if (dnsAddresses && dnsAddresses.length > 0 && dnsAddresses.some(dnsIp => dnsIp == currentTxt)) {
+                  crossIps.push({ip: currentTxt, domain: domain, pid: matchedRule.pid});
+                }
+              }
+            }
+          }
         } else if (ipsetName.indexOf("_country:") > -1 && iptool.isV4Format(currentTxt)) {
           matchedRules = rules.filter(rule => rule.type == "country" && ipsetName === Block.getDstSet(countryUpdater.getCategory(rule.target)));
         }
 
         if (matchedRules.length > 0) {
-          result.push.apply(result, matchedRules.map((rule) => rule.pid));
+          polices.push.apply(polices, matchedRules.map((rule) => rule.pid));
         }
       }
     }
 
-    return _.uniqWith(result, _.isEqual);
+    let result = {};
+    result.polices = _.uniqWith(polices, _.isEqual);
+    result.crossIps = _.uniqWith(crossIps, _.isEqual);
+    return result;
   }
 
   async checkRunPolicies(initialFlag) {
