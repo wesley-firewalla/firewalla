@@ -142,6 +142,7 @@ const Alarm = require('../alarm/Alarm.js');
 const FRPSUCCESSCODE = 0;
 const DNSMASQ = require('../extension/dnsmasq/dnsmasq.js');
 const dnsmasq = new DNSMASQ();
+const RateLimiterRedis = require('../vendor_lib/rate-limiter-flexible/RateLimiterRedis.js');
 class netBot extends ControllerBot {
 
   _vpn(ip, value, callback = () => { }) {
@@ -355,6 +356,24 @@ class netBot extends ControllerBot {
     this.eptCloudExtension.run(); // auto update group info from cloud
 
     this.sensorConfig = config.controller.sensor;
+
+    // Enhancement: need rate limit on the box api
+    const currentConfig = fc.getConfig(true);
+    const rateLimitOptions = currentConfig.ratelimit || {}
+    this.rateLimiter = {};
+    this.rateLimiter.app = new RateLimiterRedis({
+      redis: rclient,
+      keyPrefix: `ratelimit:app`,
+      points: rateLimitOptions.appMax || 60,
+      duration: rateLimitOptions.duration || 60//per second
+    })
+    this.rateLimiter.web = new RateLimiterRedis({
+      redis: rclient,
+      keyPrefix: `ratelimit:web`,
+      points: rateLimitOptions.webMax || 200,
+      duration: rateLimitOptions.duration || 60//per second
+    })
+
     //flow.summaryhours
     sysManager.update((err, data) => {
     });
@@ -2094,7 +2113,9 @@ class netBot extends ControllerBot {
       netBotTool.prepareDetailedCategoryFlowsFromCache(jsonobj, options),
       this.hostManager.yesterdayStatsForInit(jsonobj, 'intf:' + target),
       this.hostManager.last60MinStatsForInit(jsonobj, 'intf:' + target),
-      this.hostManager.last30daysStatsForInit(jsonobj, 'intf:' + target)
+      this.hostManager.last30daysStatsForInit(jsonobj, 'intf:' + target),
+      this.hostManager.newLast24StatsForInit(jsonobj, 'intf:' + target),
+      this.hostManager.last12MonthsStatsForInit(jsonobj, 'intf:' + target)
     ])
 
     if (!jsonobj.flows['appDetails']) { // fallback to old way
@@ -2157,7 +2178,9 @@ class netBot extends ControllerBot {
       netBotTool.prepareDetailedCategoryFlowsFromCache(jsonobj, options),
       this.hostManager.yesterdayStatsForInit(jsonobj, 'tag:' + target),
       this.hostManager.last60MinStatsForInit(jsonobj, 'tag:' + target),
-      this.hostManager.last30daysStatsForInit(jsonobj, 'tag:' + target)
+      this.hostManager.last30daysStatsForInit(jsonobj, 'tag:' + target),
+      this.hostManager.newLast24StatsForInit(jsonobj, 'tag:' + target),
+      this.hostManager.last12MonthsStatsForInit(jsonobj, 'tag:' + target)
     ])
 
     if (!jsonobj.flows['appDetails']) { // fallback to old way
@@ -2269,7 +2292,9 @@ class netBot extends ControllerBot {
         netBotTool.prepareDetailedCategoryFlowsForHostFromCache(jsonobj, mac, options),
         this.hostManager.yesterdayStatsForInit(jsonobj, mac),
         this.hostManager.last60MinStatsForInit(jsonobj, mac),
-        this.hostManager.last30daysStatsForInit(jsonobj, mac)
+        this.hostManager.last30daysStatsForInit(jsonobj, mac),
+        this.hostManager.newLast24StatsForInit(jsonobj, mac),
+        this.hostManager.last12MonthsStatsForInit(jsonobj, mac)
       ])
 
       if (!jsonobj.flows["appDetails"]) {
@@ -2372,6 +2397,14 @@ class netBot extends ControllerBot {
       case "shutdown":
         (async () => {
           sysTool.shutdownServices()
+          this.simpleTxData(msg, {}, null, callback);
+        })().catch((err) => {
+          this.simpleTxData(msg, {}, err, callback);
+        })
+        break
+      case "shutdown:cancel":
+        (async () => {
+          await sysTool.cancelShutdown()
           this.simpleTxData(msg, {}, null, callback);
         })().catch((err) => {
           this.simpleTxData(msg, {}, err, callback);
@@ -2808,6 +2841,15 @@ class netBot extends ControllerBot {
         })
         break;
       }
+      case "acl:check": {
+        (async () => {
+          const matchedRule = await pm2.checkACL(value.localMac, value.localPort, value.remoteType, value.remoteVal, value.remotePort, value.protocol, value.direction || "outbound");
+          this.simpleTxData(msg, {matchedRule: matchedRule}, null, callback);
+        })().catch((err) => {
+          this.simpleTxData(msg, null, err, callback);
+        })
+        break;
+      }
       case "intel:finger":
         (async () => {
           const target = value.target;
@@ -2860,7 +2902,8 @@ class netBot extends ControllerBot {
         break;
       case "startSupport":
         (async () => {
-          let { config, errMsg } = await frp.remoteSupportStart();
+          const timeout = (value && value.timeout) || null;
+          let { config, errMsg } = await frp.remoteSupportStart(timeout);
           if (config.startCode == FRPSUCCESSCODE) {
             let newPassword = await ssh.resetRandomPasswordAsync();
             sysManager.setSSHPassword(newPassword); // in-memory update
@@ -3138,7 +3181,7 @@ class netBot extends ControllerBot {
 
           await categoryUpdater.addIncludedDomain(category, domain)
           sem.emitEvent({
-            type: "UPDATE_CATEGORY_DYNAMIC_DOMAIN",
+            type: "UPDATE_CATEGORY_DOMAIN",
             category: category,
             domain: domain,
             action: "addIncludeDomain",
@@ -3156,7 +3199,7 @@ class netBot extends ControllerBot {
           const domain = value.domain
           await categoryUpdater.removeIncludedDomain(category, domain)
           sem.emitEvent({
-            type: "UPDATE_CATEGORY_DYNAMIC_DOMAIN",
+            type: "UPDATE_CATEGORY_DOMAIN",
             category: category,
             domain: domain,
             action: "removeIncludeDomain",
@@ -3174,7 +3217,7 @@ class netBot extends ControllerBot {
           const domain = value.domain
           await categoryUpdater.addExcludedDomain(category, domain)
           sem.emitEvent({
-            type: "UPDATE_CATEGORY_DYNAMIC_DOMAIN",
+            type: "UPDATE_CATEGORY_DOMAIN",
             domain: domain,
             action: "addExcludeDomain",
             category: category,
@@ -3192,7 +3235,7 @@ class netBot extends ControllerBot {
           const domain = value.domain
           await categoryUpdater.removeExcludedDomain(category, domain)
           sem.emitEvent({
-            type: "UPDATE_CATEGORY_DYNAMIC_DOMAIN",
+            type: "UPDATE_CATEGORY_DOMAIN",
             domain: domain,
             action: "removeExcludeDomain",
             category: category,
@@ -3239,7 +3282,7 @@ class netBot extends ControllerBot {
             return name !== "fishboneVPN1" && name !== cn;
           }).length >= allowCustomizedProfiles) {
             // Only one customized VPN profile is supported currently besides default VPN profile fishboneVPN1
-            this.simpleTxData(msg, {}, { code: 401, msg: 'Only one customized VPN profile is supported.' }, callback);
+            this.simpleTxData(msg, {}, { code: 401, msg: `Only ${allowCustomizedProfiles} customized VPN profile${allowCustomizedProfiles > 1 ? 's are' : ' is'} supported.` }, callback);
           } else {
             const systemPolicy = await this.hostManager.loadPolicyAsync();
             const vpnConfig = JSON.parse(systemPolicy["vpn"] || "{}");
@@ -3787,7 +3830,7 @@ class netBot extends ControllerBot {
                 const secondaryInterface = config.secondaryInterface;
                 const secondaryIpSubnet = iptool.cidrSubnet(secondaryInterface.ip);
                 this.hostManager.loadPolicy((err, data) => {
-                  let secondaryDnsServers = sysManager.myDNS();
+                  let secondaryDnsServers = sysManager.myDefaultDns();
                   if (data.dnsmasq) {
                     const dnsmasq = JSON.parse(data.dnsmasq);
                     if (dnsmasq.secondaryDnsServers && dnsmasq.secondaryDnsServers.length !== 0) {
@@ -3815,7 +3858,7 @@ class netBot extends ControllerBot {
                 const alternativeInterface = config.alternativeInterface || { ip: sysManager.mySubnet(), gateway: sysManager.myGateway() }; // default value is current ip/subnet/gateway on monitoring interface
                 const alternativeIpSubnet = iptool.cidrSubnet(alternativeInterface.ip);
                 this.hostManager.loadPolicy((err, data) => {
-                  let alternativeDnsServers = sysManager.myDNS();
+                  let alternativeDnsServers = sysManager.myDefaultDns();
                   if (data.dnsmasq) {
                     const dnsmasq = JSON.parse(data.dnsmasq);
                     if (dnsmasq.alternativeDnsServers && dnsmasq.alternativeDnsServers.length != 0) {
@@ -3892,6 +3935,26 @@ class netBot extends ControllerBot {
         })
         break;
       }
+      case "apt-get":
+        (async () => {
+          let cmd = `${f.getFirewallaHome()}/scripts/apt-get.sh`;
+          if (value.execPreUpgrade) cmd = `${cmd} -pre "${value.execPreUpgrade}"`;
+          if (value.execPostUpgrade) cmd = `${cmd} -pst "${value.execPostUpgrade}"`;
+          if (value.noUpdate) cmd = cmd + ' -nu';
+          if (value.noReboot) cmd = cmd + ' -nr';
+          if (value.forceReboot) cmd = cmd + ' -fr';
+
+          if (!value.action) throw new Error('Missing parameter "action"')
+
+          cmd = `${cmd} ${value.action}`;
+
+          log.info('Running apt-get', cmd)
+          await execAsync(`(${cmd}) 2>&1 | sudo tee -a /var/log/fwapt.log `);
+          this.simpleTxData(msg, {}, null, callback);
+        })().catch((err) => {
+          this.simpleTxData(msg, {}, err, callback);
+        })
+        break
       default:
         // unsupported action
         this.simpleTxData(msg, {}, new Error("Unsupported cmd action: " + msg.data.item), callback);
@@ -4021,19 +4084,28 @@ class netBot extends ControllerBot {
     }
   }
 
-  msgHandlerAsync(gid, rawmsg) {
+  msgHandlerAsync(gid, rawmsg, from = 'app') {
     return new Promise((resolve, reject) => {
       let processed = false; // only callback once
-      this.msgHandler(gid, rawmsg, (err, response) => {
-        if (processed)
-          return;
-
-        processed = true;
-        if (err) {
-          reject(err);
-        } else {
-          resolve(response);
+      this.rateLimiter[from].consume('msg_handler').then((rateLimiterRes) => {
+        this.msgHandler(gid, rawmsg, (err, response) => {
+          if (processed)
+            return;
+          processed = true;
+          if (err) {
+            reject(err);
+          } else {
+            resolve(response);
+          }
+        })
+      }).catch((rateLimiterRes) => {
+        const error = {
+          "Retry-After": rateLimiterRes.msBeforeNext / 1000,
+          "X-RateLimit-Limit": this.rateLimiter[from].points,
+          "X-RateLimit-Reset": new Date(Date.now() + rateLimiterRes.msBeforeNext)
         }
+        processed = true;
+        reject(error);
       })
     })
   }
@@ -4059,7 +4131,7 @@ class netBot extends ControllerBot {
 
       if (rawmsg.message.obj.type === "jsonmsg") {
         if (rawmsg.message.obj.mtype === "init") {
-
+        
           if (rawmsg.message.appInfo) {
             this.processAppInfo(rawmsg.message.appInfo)
           }

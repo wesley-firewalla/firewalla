@@ -147,6 +147,7 @@ storage.initSync({
 
 (async() => {
   await fireRouter.waitTillReady();
+  await sysManager.waitTillInitialized();
   await rclient.delAsync("firekick:pairing:message");
   if (!platform.isFireRouterManaged()) {
     await interfaceDiscoverSensor.run()
@@ -199,6 +200,11 @@ async function initializeGroup() {
 
 
 async function postAppLinked() {
+  
+  if(platform.getName() == 'gold') { // no post action on Gold
+    return;
+  }
+
   await platform.turnOffPowerLED();
   // When app is linked, to secure device, ssh password will be
   // automatically reset when boot up every time

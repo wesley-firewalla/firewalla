@@ -16,7 +16,6 @@
 const log = require('./logger.js')(__filename);
 
 const rclient = require('../util/redis_manager.js').getRedisClient()
-const sclient = require('../util/redis_manager.js').getSubscriptionClient();
 
 const exec = require('child-process-promise').exec
 
@@ -88,7 +87,6 @@ const OpenVPNClient = require('../extension/vpnclient/OpenVPNClient.js');
 const vpnClientEnforcer = require('../extension/vpnclient/VPNClientEnforcer.js');
 
 const iptables = require('./Iptables.js');
-const ipset = require('./Ipset.js');
 
 const DNSTool = require('../net2/DNSTool.js')
 const dnsTool = new DNSTool()
@@ -101,10 +99,7 @@ const fs = require('fs');
 const Promise = require('bluebird');
 Promise.promisifyAll(fs);
 
-const Message = require('./Message.js');
 const SysInfo = require('../extension/sysinfo/SysInfo.js');
-
-const {Rule} = require("./Iptables.js");
 
 const INACTIVE_TIME_SPAN = 60 * 60 * 24 * 7;
 
@@ -118,35 +113,12 @@ module.exports = class HostManager {
       this.hosts.all = [];
       this.callbacks = {};
       this.policy = {};
-      sysManager.update((err) => {
-        if (err == null) {
-          log.info("System Manager Updated");
-          if(!f.isDocker()) {
-            spoofer = new Spoofer({}, false);
-          } else {
-            // for docker
-            spoofer = {
-              isSecondaryInterfaceIP: () => {},
-              newSpoof: () => new Promise(resolve => resolve()),
-              newUnspoof: () => new Promise(resolve => resolve()),
-              newSpoof6: () => new Promise(resolve => resolve()),
-              newUnspoof6: () => new Promise(resolve => resolve()),
-              spoof: () => {},
-              spoofMac6: () => {},
-              clean: () => {},
-              clean7: () => {},
-              clean6byIp: () => {},
-              clean6: () => {},
-              validateV6Spoofs: () => {},
-              validateV4Spoofs: () => {},
-            };
-          }
-        }
-      });
+      spoofer = new Spoofer({}, false);
 
       let c = require('./MessageBus.js');
       this.messageBus = new c("info");
       this.iptablesReady = false;
+      this.spoofing = true;
 
       // ONLY register for these events in FireMain process
       if(f.isMain()) {
@@ -251,7 +223,7 @@ module.exports = class HostManager {
     }
 
     json.cpuid = platform.getBoardSerial();
-    json.uptime = process.uptime()
+    json.uptime = process.uptime();
 
     if(sysManager.language) {
       json.language = sysManager.language;
@@ -305,6 +277,8 @@ module.exports = class HostManager {
     json.model = platform.getName();
     json.branch = f.getBranch();
     if(frp.started && f.isApi()) {
+      json.remoteSupportStartTime = frp.startTime;
+      json.remoteSupportEndTime = frp.endTime;
       json.remoteSupportConnID = frp.port + ""
       json.remoteSupportPassword = json.ssh
     }
@@ -321,6 +295,7 @@ module.exports = class HostManager {
     }
     const sysInfo = SysInfo.getSysInfo();
     json.no_auto_upgrade = sysInfo.no_auto_upgrade;
+    json.osUptime = sysInfo.osUptime;
   }
 
 
@@ -340,14 +315,7 @@ module.exports = class HostManager {
     const uploadStats = await getHitsAsync(uploadKey, "1hour", countHours);
     downloadStats.splice(downloadStats.length - todayHours);
     uploadStats.splice(uploadStats.length - todayHours);
-    let totalDownload = 0, totalUpload = 0;
-    downloadStats.forEach((item) => {
-      totalDownload = totalDownload + item[1] * 1
-    })
-    uploadStats.forEach((item) => {
-      totalUpload = totalUpload + item[1] * 1
-    })
-    json.yesterday = { upload: uploadStats, download: downloadStats, totalDownload: totalDownload, totalUpload: totalUpload };
+    json.yesterday = this.generateStats(downloadStats,uploadStats);
     return json;
   }
 
@@ -359,6 +327,19 @@ module.exports = class HostManager {
     json.last24 = { upload: u, download: d, now: Math.round(new Date() / 1000)};
 
     return json;
+  }
+  async newLast24StatsForInit(json, target) {
+    const subKey = target ? ':' + target : ''
+    let downloadStats = await getHitsAsync("download" + subKey, "1hour", 24)
+    let uploadStats = await getHitsAsync("upload" + subKey, "1hour", 24)
+    json.newLast24 = this.generateStats(downloadStats, uploadStats);
+  }
+
+  async last12MonthsStatsForInit(json, target) {
+    const subKey = target ? ':' + target : ''
+    let downloadStats = await getHitsAsync("download" + subKey, "1month", 12)
+    let uploadStats = await getHitsAsync("upload" + subKey, "1month", 12)
+    json.last12Months = this.generateStats(downloadStats,uploadStats);
   }
 
   async last60MinStats() {
@@ -394,21 +375,10 @@ module.exports = class HostManager {
     const uploadKey = `upload${mac ? ':' + mac : ''}`;
     const downloadStats = await getHitsAsync(downloadKey, '1day', days) || [];
     const uploadStats = await getHitsAsync(uploadKey, '1day', days) || [];
-    let totalDownload = 0, totalUpload = 0;
-    downloadStats.forEach((item) => {
-      totalDownload = totalDownload + item[1] * 1
-    })
-    uploadStats.forEach((item) => {
-      totalUpload = totalUpload + item[1] * 1
-    })
-    return {
-      downloadStats: downloadStats,
-      uploadStats: uploadStats,
-      totalDownload: totalDownload,
-      totalUpload: totalUpload,
+    return Object.assign({
       monthlyBeginTs: monthlyBeginTs / 1000,
       monthlyEndTs: monthlyEndTs / 1000
-    }
+    }, this.generateStats(downloadStats, uploadStats))
   }
 
   async last60MinStatsForInit(json, target) {
@@ -426,23 +396,7 @@ module.exports = class HostManager {
     } else {
       uploadStats = uploadStats.slice(1)
     }
-
-    let totalDownload = 0
-    downloadStats.forEach((s) => {
-      totalDownload += s[1]
-    })
-
-    let totalUpload = 0
-    uploadStats.forEach((s) => {
-      totalUpload += s[1]
-    })
-
-    json.last60 = {
-      upload: uploadStats,
-      download: downloadStats,
-      totalUpload: totalUpload,
-      totalDownload: totalDownload
-    }
+    json.last60 = this.generateStats(downloadStats,uploadStats);
   }
 
   async last60MinTopTransferForInit(json) {
@@ -468,23 +422,7 @@ module.exports = class HostManager {
     const subKey = target ? ':' + target : ''
     let downloadStats = await getHitsAsync("download" + subKey, "1day", 30)
     let uploadStats = await getHitsAsync("upload" + subKey, "1day", 30)
-
-    let totalDownload = 0
-    downloadStats.forEach((s) => {
-      totalDownload += s[1]
-    })
-
-    let totalUpload = 0
-    uploadStats.forEach((s) => {
-      totalUpload += s[1]
-    })
-
-    json.last30 = {
-      upload: uploadStats,
-      download: downloadStats,
-      totalUpload: totalUpload,
-      totalDownload: totalDownload
-    }
+    json.last30 = this.generateStats(downloadStats,uploadStats);
   }
 
   policyDataForInit(json) {
@@ -966,10 +904,12 @@ module.exports = class HostManager {
         let requiredPromises = [
           this.yesterdayStatsForInit(json),
           this.last24StatsForInit(json),
+          this.newLast24StatsForInit(json),
           this.last60MinStatsForInit(json),
           //            this.last60MinTopTransferForInit(json),
           this.extensionDataForInit(json),
           this.last30daysStatsForInit(json),
+          this.last12MonthsStatsForInit(json),
           this.policyDataForInit(json),
           this.legacyHostsStats(json),
           this.modeForInit(json),
@@ -1195,7 +1135,7 @@ module.exports = class HostManager {
 
     // Only allow requests be executed in a frenquency lower than 1 every 5 mins
     const getHostsActiveExpire = Math.floor(new Date() / 1000) - 60 * 5 // 5 mins
-    if (this.getHostsActive && this.getHostsActive > getHostsActiveExpire) {              
+    if (this.getHostsActive && this.getHostsActive > getHostsActiveExpire) {
       log.info("getHosts: too frequent, returning cache");
       if(this.hosts.all && this.hosts.all.length>0){
         return this.hosts.all
@@ -1374,16 +1314,24 @@ module.exports = class HostManager {
     return obj
   }
 
+  isMonitoring() {
+    return this.spoofing;
+  }
+
+  async acl(state) {
+    if (state == false) {
+      await iptables.switchACLAsync(false);
+      await iptables.switchACLAsync(false, 6);
+    } else {
+      await iptables.switchACLAsync(true);
+      await iptables.switchACLAsync(true, 6);
+    }
+  }
+
   async spoof(state) {
-    log.debug("System:Spoof:", state, this.spoofing);
+    this.spoofing = state;
     const sm = new SpooferManager();
     if (state == false) {
-      await iptables.switchMonitoringAsync(false);
-      await iptables.switchMonitoringAsync(false, 6);
-      // flush all ip addresses
-      // log.info("Flushing all ip addresses from monitoredKeys since monitoring is switched off")
-      // no need to empty spoof set since dev flag file is placed now
-      // await sm.emptySpoofSet();
       // create dev flag file if it does not exist, and restart bitbridge
       // bitbridge binary will be replaced with mock file if this flag file exists
       await fs.accessAsync(`${f.getFirewallaHome()}/bin/dev`, fs.constants.F_OK).catch((err) => {
@@ -1396,9 +1344,6 @@ module.exports = class HostManager {
       if (redisSpoofOff) {
         return;
       }
-
-      await iptables.switchMonitoringAsync(true);
-      await iptables.switchMonitoringAsync(true, 6);
       // remove dev flag file if it exists and restart bitbridge
       await fs.accessAsync(`${f.getFirewallaHome()}/bin/dev`, fs.constants.F_OK).then(() => {
         return exec(`rm ${f.getFirewallaHome()}/bin/dev`).then(() => {
@@ -1814,6 +1759,21 @@ module.exports = class HostManager {
           delete h.oper
         }
       }
+    }
+  }
+  generateStats(downloadStats = [], uploadStats = []) {
+    let totalDownload = 0, totalUpload = 0;
+    downloadStats.forEach((s) => {
+      totalDownload = totalDownload + s[1] * 1;
+    })
+    uploadStats.forEach((s) => {
+      totalUpload = totalUpload + s[1] * 1;
+    })
+    return {
+      upload: uploadStats,
+      download: downloadStats,
+      totalUpload: totalUpload,
+      totalDownload: totalDownload
     }
   }
 }
