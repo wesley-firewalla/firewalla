@@ -322,6 +322,13 @@ module.exports = class FlowMonitor {
               intelobj.pr = flow.pr;
             }
 
+            if (flow.intf && _.isString(flow.intf)) {
+              intelobj.intf = flow.intf;
+            }
+            if (flow.tags && _.isArray(flow.tags)) {
+              intelobj.tags = flow.tags;
+            }
+
             log.info("Intel:Flow Sending Intel", JSON.stringify(intelobj));
 
             this.publisher.publish("DiscoveryEvent", "Intel:Detected", intelobj['id.orig_h'], intelobj);
@@ -1036,7 +1043,8 @@ module.exports = class FlowMonitor {
     }
 
     let severity = iobj.severityscore > 50 ? "major" : "minor";
-    let reason = iobj.reason;
+    const reason = (_.isArray(iobj.category) && iobj.category.join(",")) || "";
+    const primaryReason = (_.isArray(iobj.category) && iobj.category.length > 0 && iobj.category[0]) || "";
 
     if (!fc.isFeatureOn("cyber_security")) {
       return;
@@ -1051,6 +1059,7 @@ module.exports = class FlowMonitor {
       "p.dest.name": domain || remoteIP,
       "p.dest.port": this.getRemotePort(flowObj),
       "p.security.reason": reason,
+      "p.security.primaryReason": primaryReason,
       "p.security.numOfReportSources": iobj.count,
       "p.local_is_client": (flowObj.fd === 'in' ? "1" : "0"),
       // "p.dest.whois": JSON.stringify(iobj.whois),
